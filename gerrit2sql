@@ -1,0 +1,191 @@
+#!/usr/bin/python
+
+import glob
+import json
+import multiprocessing
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+
+def exec_cmd(command):
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    output, error = process.communicate()
+
+    return output, error
+
+
+def rm_logs():
+    exec_cmd('rm -r ./logs.openstack.org')
+
+
+def wget(url):
+    try:
+        # It seems like logs.openstack.org is kind of sensitive!
+        time.sleep(1)
+
+        _, error = exec_cmd(
+            'wget -r --no-parent -e robots=off -l2 -A.subunit.gz %s' % url)
+    except Exception as e:
+        print e
+
+
+def gzip(path):
+    _, error = exec_cmd('gzip -dk %s' % path)
+    if error:
+        print 'Could not gzip %s, error: %s' % (path, error)
+
+
+def mysql(query, db_name='', user_name='', password=''):
+    command = 'mysql -u root %s ' % db_name
+    if user_name:
+        command += '--user=%s ' % user_name
+    if password:
+        command += '--password=%s ' % password
+
+    command += '-e "%s"' % query
+    output, error = exec_cmd(command)
+    if error:
+        print error
+
+    return output
+
+
+def get_db_connection(db_name, user_name, password):
+    return ('mysql://%(user_name)s:%(password)s@127.0.0.1/%(db_name)s' %
+            {'db_name': db_name, 'user_name': user_name, 'password': password})
+
+
+def get_db_credentials(db_connection):
+    result = re.search(r'mysql://(.+):(.+)@(.+)/(.+)', db_connection)
+    return result.group(4), result.group(1), result.group(2)
+
+
+def create_db():
+    def get_random_string():
+        return str(uuid.uuid4()).replace('-', '')[:16]
+
+    db_name = get_random_string()
+    user_name = get_random_string()
+    password = get_random_string()
+    substitution = {'db_name': db_name,
+                    'user_name': user_name,
+                    'password': password}
+    print ('Creating temporary DB %(db_name)s, user %(user_name)s, '
+           'password %(password)s' % substitution)
+    mysql("CREATE DATABASE %(db_name)s;" % substitution)
+    mysql(("CREATE USER '%(user_name)s'@'localhost' IDENTIFIED BY "
+           "'%(password)s';" % substitution))
+    mysql(("GRANT ALL PRIVILEGES ON %(db_name)s.* TO "
+           "'%(user_name)s'@'localhost';" % substitution))
+    db_connection = get_db_connection(db_name, user_name, password)
+    exec_cmd('subunit2sql-db-manage --database-connection %s upgrade head' %
+             db_connection)
+    import time
+    time.sleep(10)
+    return db_name, user_name, password
+
+
+def drop_db(db_name, user_name):
+    mysql("DROP USER '%s'@'localhost';" % user_name)
+    mysql("DROP DATABASE %s;" % db_name)
+
+
+def subunit2sql(db_connection, paths):
+    _, error = exec_cmd(
+        'subunit2sql --database-connection %s %s' % (db_connection, paths))
+    if error:
+        print 'Error while executing subunit2sql for %s, error: %s' % \
+            (paths, error)
+
+
+def main(age, limit, gerrit_user, project, job, queue, db_connection=None,
+         should_drop_db=False):
+    print 'Grabbing %(limit)s patches from the last %(age)s days' % \
+          {'limit': limit, 'age': age}
+    cmd = (
+        'ssh -p 29418 %(gerrit_user)s@review.openstack.org gerrit query '
+        '--current-patch-set --format json status:open project:%(project)s '
+        '-- age:%(age)sd branch:master limit:%(limit)s' %
+          {'gerrit_user': gerrit_user,
+           'project': project,
+           'age': age,
+           'limit': limit})
+    query, error = exec_cmd(cmd)
+    if error and not query:
+        print 'Could not execute gerrit query: %s' % error
+        sys.exit(1)
+
+    lines = query.split('\n')
+    data = [json.loads(line) for line in lines[:-2]]
+
+    rm_logs()
+    n_patches = len(data)
+    print 'Found metadata for %s patches' % n_patches
+    for i, patch in enumerate(data):
+        change = patch['number']
+        patch_set = patch['currentPatchSet']['number']
+        url_format = ('http://logs.openstack.org/%(change_suffix)s/%(change)s/'
+                      '%(patch_set)s/%(queue)s/%(job)s')
+        log_url = url_format % {'change_suffix': change[4:],
+                                'change': change,
+                                'patch_set': patch_set,
+                                'queue': queue,
+                                'job': job}
+        print 'Downloading %(url)s: %(current)s/%(total)s' % {
+            'url': log_url,
+            'current': i + 1,
+            'total': n_patches}
+        wget(log_url)
+
+    files = glob.glob(
+        'logs.openstack.org/*/*/*/*/*/*/testrepository.subunit.gz')
+    if not files:
+        print 'Could not find any subunit streams.'
+        sys.exit(1)
+
+    print 'Extracting %s streams from .gz(s)' % len(files)
+    pool = multiprocessing.Pool()
+    pool.map(gzip, files)
+    pool.close()
+    pool.join()
+
+    files = glob.glob('logs.openstack.org/*/*/*/*/*/*/testrepository.subunit')
+
+    if db_connection is None:
+        db_name, user_name, password = create_db()
+        db_connection = get_db_connection(db_name, user_name, password)
+    else:
+        db_name, user_name, password = get_db_credentials(db_connection)
+
+    print 'Inserting %s streams into %s' % (len(files), db_connection)
+    subunit2sql(db_connection, ' '.join(files))
+
+    print 'Outputting test failures...'
+    print mysql('select test_id,failure from tests where failure > 0 '
+                'order by failure desc;',
+                db_name=db_name, user_name=user_name, password=password)
+
+    if should_drop_db:
+        drop_db(db_name, user_name)
+
+if __name__ == '__main__':
+    age = 7
+    limit = 3
+    project = 'openstack/neutron'
+    job = 'gate-neutron-dsvm-fullstack'
+    queue = 'check'
+    db_connection = None  # 'mysql://subunit:1@127.0.0.1/subunit'
+    gerrit_user = 'amuller'
+    should_drop_db = False
+    main(age,
+         limit,
+         gerrit_user,
+         project,
+         job,
+         queue,
+         db_connection,
+         should_drop_db)
