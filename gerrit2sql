@@ -1,5 +1,6 @@
 #!/usr/bin/python
 
+import argparse
 import glob
 import json
 import multiprocessing
@@ -24,9 +25,6 @@ def rm_logs():
 
 def wget(url):
     try:
-        # It seems like logs.openstack.org is kind of sensitive!
-        time.sleep(1)
-
         _, error = exec_cmd(
             'wget -r --no-parent -e robots=off -l2 -A.subunit.gz %s' % url)
     except Exception as e:
@@ -84,12 +82,11 @@ def create_db():
     db_connection = get_db_connection(db_name, user_name, password)
     exec_cmd('subunit2sql-db-manage --database-connection %s upgrade head' %
              db_connection)
-    import time
-    time.sleep(10)
     return db_name, user_name, password
 
 
 def drop_db(db_name, user_name):
+    print 'Cleaning up db %s and user %s' % (db_name, user_name)
     mysql("DROP USER '%s'@'localhost';" % user_name)
     mysql("DROP DATABASE %s;" % db_name)
 
@@ -102,18 +99,24 @@ def subunit2sql(db_connection, paths):
             (paths, error)
 
 
-def main(age, limit, gerrit_user, project, job, queue, db_connection=None,
-         should_drop_db=False):
-    print 'Grabbing %(limit)s patches from the last %(age)s days' % \
+def main(age, limit, gerrit_user, project, job, queue, db_connection,
+         should_drop_db):
+    if not limit:
+        limit = ''
+    msg = 'Grabbing %(limit)s patches from the last %(age)s days' % \
           {'limit': limit, 'age': age}
+    print msg
+    if gerrit_user:
+        gerrit_user += '@'
     cmd = (
-        'ssh -p 29418 %(gerrit_user)s@review.openstack.org gerrit query '
-        '--current-patch-set --format json status:open project:%(project)s '
-        '-- age:%(age)sd branch:master limit:%(limit)s' %
+        'ssh -p 29418 %(gerrit_user)sreview.openstack.org gerrit query '
+        '--current-patch-set --format json status:merged project:%(project)s '
+        '-- -age:%(age)sd branch:master ' %
           {'gerrit_user': gerrit_user,
            'project': project,
-           'age': age,
-           'limit': limit})
+           'age': age})
+    if limit:
+        cmd += 'limit:%s' % limit
     query, error = exec_cmd(cmd)
     if error and not query:
         print 'Could not execute gerrit query: %s' % error
@@ -140,6 +143,8 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection=None,
             'current': i + 1,
             'total': n_patches}
         wget(log_url)
+        # It seems like logs.openstack.org is sensitive. Throttle the requests.
+        time.sleep(1)
 
     files = glob.glob(
         'logs.openstack.org/*/*/*/*/*/*/testrepository.subunit.gz')
@@ -161,31 +166,71 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection=None,
     else:
         db_name, user_name, password = get_db_credentials(db_connection)
 
-    print 'Inserting %s streams into %s' % (len(files), db_connection)
+    print 'Inserting %s streams into %s. This can take a while.' % \
+          (len(files), db_connection)
     subunit2sql(db_connection, ' '.join(files))
 
     print 'Outputting test failures...'
-    print mysql('select test_id,failure from tests where failure > 0 '
-                'order by failure desc;',
-                db_name=db_name, user_name=user_name, password=password)
+    result = mysql('select test_id,failure from tests where failure > 0 '
+                   'order by failure desc;',
+                   db_name=db_name, user_name=user_name, password=password)
+    print result if result else 'No failures!'
 
     if should_drop_db:
         drop_db(db_name, user_name)
 
+
+def parse_cli():
+    parser = argparse.ArgumentParser(
+        epilog='Example:\n%s --project=openstack/neutron '
+               '--queue=check --job=gate-neutron-dsvm-functional' %
+               sys.argv[0])
+    parser.add_argument(
+        '--age', type=int, default=7,
+        help='Limit the queried patches to the last N days. Defaults to 7.')
+    parser.add_argument(
+        '--limit', type=int, default=0,
+        help='Limit to N patches. Defaults to no limit.')
+    parser.add_argument(
+        '--gerrit_user', default='',
+        help='What user to query Gerrit with? Defaults to the user that runs '
+             'the script.')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--database_connection',
+        help='Database connection string to an existing database with up to'
+             ' to date subunit2sql schema. The connection string format is: '
+             'mysql://<user>:<password>@<uri>/<db_name>. If a connection '
+             'string is not provided, a temporary database is created.')
+    group.add_argument(
+        '--cleanup_database', choices=['False', 'True'], default='True',
+        help='In case a database_connection is not provided, a temporary '
+             'database is created. Should this database be cleaned up '
+             'automatically? Defaults to True.')
+    parser.add_argument(
+        '--project', required=True,
+        help='What OpenStack project to execute against.')
+    parser.add_argument(
+        '--queue', choices=['check', 'gate'], required=True,
+        help='Query the check or gate queue?')
+    parser.add_argument(
+        '--job', required=True,
+        help='What CI job to query?')
+    return parser.parse_args()
+
+
+def string_2_bool(s):
+    return s == 'True'
+
+
 if __name__ == '__main__':
-    age = 7
-    limit = 3
-    project = 'openstack/neutron'
-    job = 'gate-neutron-dsvm-fullstack'
-    queue = 'check'
-    db_connection = None  # 'mysql://subunit:1@127.0.0.1/subunit'
-    gerrit_user = 'amuller'
-    should_drop_db = False
-    main(age,
-         limit,
-         gerrit_user,
-         project,
-         job,
-         queue,
-         db_connection,
-         should_drop_db)
+    args = parse_cli()
+
+    main(args.age,
+         args.limit,
+         args.gerrit_user,
+         args.project,
+         args.job,
+         args.queue,
+         args.database_connection,
+         string_2_bool(args.cleanup_database))
