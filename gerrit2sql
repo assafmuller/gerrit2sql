@@ -4,6 +4,7 @@ import argparse
 import glob
 import json
 import multiprocessing
+import os
 import re
 import subprocess
 import sys
@@ -26,7 +27,7 @@ def rm_logs():
 def wget(url):
     try:
         _, error = exec_cmd(
-            'wget -r --no-parent -e robots=off -l2 -A.subunit.gz %s' % url)
+            'wget -r --no-parent -e robots=off -l3 -A.subunit.gz %s' % url)
     except Exception as e:
         print e
 
@@ -99,6 +100,14 @@ def subunit2sql(db_connection, paths):
             (paths, error)
 
 
+def get_files(root, file_name):
+    result = []
+    for folder, _, entries in os.walk(root):
+        result += [os.path.join(folder, file) for file in entries if file ==
+                   file_name]
+    return result
+
+
 def main(age, limit, gerrit_user, project, job, queue, db_connection,
          should_drop_db):
     if not limit:
@@ -112,9 +121,9 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection,
         'ssh -p 29418 %(gerrit_user)sreview.openstack.org gerrit query '
         '--current-patch-set --format json status:merged project:%(project)s '
         '-- -age:%(age)sd branch:master ' %
-          {'gerrit_user': gerrit_user,
-           'project': project,
-           'age': age})
+        {'gerrit_user': gerrit_user,
+         'project': project,
+         'age': age})
     if limit:
         cmd += 'limit:%s' % limit
     query, error = exec_cmd(cmd)
@@ -146,8 +155,7 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection,
         # It seems like logs.openstack.org is sensitive. Throttle the requests.
         time.sleep(1)
 
-    files = glob.glob(
-        'logs.openstack.org/*/*/*/*/*/*/testrepository.subunit.gz')
+    files = get_files('logs.openstack.org', 'testrepository.subunit.gz')
     if not files:
         print 'Could not find any subunit streams.'
         sys.exit(1)
@@ -158,8 +166,7 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection,
     pool.close()
     pool.join()
 
-    files = glob.glob('logs.openstack.org/*/*/*/*/*/*/testrepository.subunit')
-
+    files = get_files('logs.openstack.org', 'testrepository.subunit')
     if db_connection is None:
         db_name, user_name, password = create_db()
         db_connection = get_db_connection(db_name, user_name, password)
