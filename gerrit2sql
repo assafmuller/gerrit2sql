@@ -33,7 +33,7 @@ def wget(url):
 
 
 def gzip(path):
-    _, error = exec_cmd('gzip -dk %s' % path)
+    _, error = exec_cmd('gzip -dfk %s' % path)
     if error:
         print 'Could not gzip %s, error: %s' % (path, error)
 
@@ -63,10 +63,11 @@ def get_db_credentials(db_connection):
     return result.group(4), result.group(1), result.group(2)
 
 
-def create_db():
-    def get_random_string():
-        return str(uuid.uuid4()).replace('-', '')[:16]
+def get_random_string():
+    return str(uuid.uuid4()).replace('-', '')[:16]
 
+
+def create_db():
     db_name = get_random_string()
     user_name = get_random_string()
     password = get_random_string()
@@ -108,8 +109,7 @@ def get_files(root, file_name):
     return result
 
 
-def main(age, limit, gerrit_user, project, job, queue, db_connection,
-         should_drop_db):
+def grab_subunit_from_gerrit(age, limit, gerrit_user, project, job, queue):
     if not limit:
         limit = ''
     msg = 'Grabbing %(limit)s patches from the last %(age)s days' % \
@@ -119,13 +119,14 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection,
         gerrit_user += '@'
     cmd = (
         'ssh -p 29418 %(gerrit_user)sreview.openstack.org gerrit query '
-        '--current-patch-set --format json status:merged project:%(project)s '
+        '--current-patch-set --format json project:%(project)s '
         '-- -age:%(age)sd branch:master ' %
         {'gerrit_user': gerrit_user,
          'project': project,
          'age': age})
     if limit:
         cmd += 'limit:%s' % limit
+
     query, error = exec_cmd(cmd)
     if error and not query:
         print 'Could not execute gerrit query: %s' % error
@@ -167,6 +168,10 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection,
     pool.join()
 
     files = get_files('logs.openstack.org', 'testrepository.subunit')
+    return files
+
+
+def insert_subunit_to_db(files, db_connection, should_drop_db):
     if db_connection is None:
         db_name, user_name, password = create_db()
         db_connection = get_db_connection(db_name, user_name, password)
@@ -185,6 +190,13 @@ def main(age, limit, gerrit_user, project, job, queue, db_connection,
 
     if should_drop_db:
         drop_db(db_name, user_name)
+
+
+def main(age, limit, gerrit_user, project, job, queue, db_connection,
+         should_drop_db):
+    files = grab_subunit_from_gerrit(
+        age, limit, gerrit_user, project, job, queue)
+    insert_subunit_to_db(files, db_connection, should_drop_db)
 
 
 def parse_cli():
